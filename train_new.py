@@ -23,7 +23,12 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.filter_utils import *
+
+from utils.filter_utils import create_paths, save_render
+from utils.plot_utils import plot_filter, plot_histogram
+from utils.ensemble_utils import * 
+from filtering.filter import get_filter_variable, get_depth_specific_filter_variable
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -69,6 +74,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+
+    evaluated_20k = False
+    evaluated_30k = False 
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -164,19 +172,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # VOG Tracking
-            # Add gradient for tracking variance
-            gaussians.add_grad(viewspace_point_tensor, visibility_filter, img_idx, len(scene.getTrainCameras()))
+            if opt.do_filtering == True:
+                # Add gradient for tracking variance
+                gaussians.add_grads_cam(viewspace_point_tensor, visibility_filter, img_idx, len(scene.getTrainCameras()))
+                if iteration > opt.densify_until_iter:
+                    gaussians.add_grads_iter(viewspace_point_tensor, visibility_filter, num_iters=500)
 
-            # print("Num Train Cameras: ", len(scene.getTrainCameras()), "Num added to grad tracker: ", torch.count_nonzero(gaussians.img_idxs_grads_stored))
-            # TODO Fix when this if statement is triggered (specifically the first part)
-            if abs(10000 - (iteration % 10000)) <= 2 * len(scene.getTrainCameras()) and torch.count_nonzero(gaussians.img_idxs_grads_stored) == (len(scene.getTrainCameras())):
-                print("It's Filtering Time!")
-                evaluate_gaussian_filtering(tb_writer, opt, iteration, scene, (pipe, background), dataset)
-                
-            if iteration <= opt.densify_until_iter and iteration % opt.densification_interval == 0:
-                    gaussians.reset_grad_tracking()
-            elif iteration > opt.densify_until_iter and torch.count_nonzero(gaussians.img_idxs_grads_stored) == (len(scene.getTrainCameras())): # Once cycled through all images, reset
-                    gaussians.reset_grad_tracking()
+                timing_condition_1 = 0 < 20000 - iteration <= 5 * len(scene.getTrainCameras()) and not evaluated_20k
+                timing_condition_2 = 0 < 30000 - iteration <= 5 * len(scene.getTrainCameras()) and not evaluated_30k
+                grads_cam_condition = torch.count_nonzero(gaussians.get_cam_idxs_grads_stored()) == (len(scene.getTrainCameras()))
+                if (timing_condition_1 or timing_condition_2) and grads_cam_condition:
+                    print("It's Filtering Time!")
+                    if iteration < 20000:
+                        evaluated_20k = True
+                    elif iteration < 30000:
+                        evaluated_30k = True
+                    evaluate_gaussian_filtering(tb_writer, opt, iteration, scene, (pipe, background), dataset)
+                    
+                if iteration <= opt.densify_until_iter and iteration % opt.densification_interval == 0:
+                        gaussians.reset_grad_cam_tracking()
+                elif iteration > opt.densify_until_iter and torch.count_nonzero(gaussians.get_cam_idxs_grads_stored()) == (len(scene.getTrainCameras())): # Once cycled through all images, reset
+                        gaussians.reset_grad_cam_tracking()
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -269,6 +285,27 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
+def get_rendered_uncertainty(viewpoint, scene : Scene, renderArgs, uq_variable, method, iteration, uq_path, save=True):
+    render_uncertainty_pkg = render_uncertainty(uq_variable, viewpoint, scene.gaussians, *renderArgs)
+    render_uncertainty_image = render_uncertainty_pkg["render"][0].unsqueeze(0)
+
+    if torch.any(torch.logical_or(torch.isnan(render_uncertainty_image), torch.isinf(render_uncertainty_image))):
+        valid_uncertainties = render_uncertainty_image[torch.logical_not(torch.logical_or(torch.isnan(render_uncertainty_image), torch.isinf(render_uncertainty_image)))]
+        if len(valid_uncertainties) == 0:
+            print(f"[eval] everything is nan for UQ")
+            not_nan_max = 100.0 # TODO Should look into this value and this general if-statement
+        else:
+            not_nan_max = torch.max(valid_uncertainties).item()
+        render_uncertainty_image = torch.nan_to_num(render_uncertainty_image, not_nan_max, not_nan_max)
+
+    normalized_render_uncertainty_image = torch.clamp(render_uncertainty_image / torch.max(render_uncertainty_image), 0.0, 1.0)
+
+    if save:
+        image_name = "norm_uq_" + method + "_no_{}".format(viewpoint.image_name) + "_" + str(iteration) + ".png"
+        save_image(normalized_render_uncertainty_image, f"{uq_path}/{image_name}")
+
+    return render_uncertainty_image
+
 def evaluate_gaussian_filtering(tb_writer, opt_params, iteration, scene : Scene, renderArgs, dataset):
     torch.cuda.empty_cache()
     assert not torch.is_grad_enabled()
@@ -277,60 +314,30 @@ def evaluate_gaussian_filtering(tb_writer, opt_params, iteration, scene : Scene,
 
     print("Post Processing Filtering Gaussians")
 
-    filter_path = os.path.join(scene.model_path, "Filtering")
-    hist_path = os.path.join(scene.model_path, "Histogram")
-    image_path = os.path.join(scene.model_path, "Renders")
-    if not os.path.exists(filter_path):
-        os.makedirs(filter_path)
-    if not os.path.exists(hist_path):
-        os.makedirs(hist_path)
-    if not os.path.exists(image_path):
-        os.makedirs(image_path)
-
+    filter_path, hist_path, image_path, uq_path = create_paths(scene)
     methods = opt_params.filter_criteria.split(",")
-
     quantiles = torch.tensor([0.8, 0.9, 0.925, 0.95, 0.975, 0.99, 0.995, 0.999, 0.9995, 0.9999, 1])
 
-    all_l1_losses = []
-    all_l_ssims = []
-    all_psnrs = []
+    all_l1_losses, all_l_ssims, all_psnrs, all_lpipses = [], [], [], []
 
     for method in methods:
         # Get filtering variables and thresholds based on method
-        if method != "depth_zs" and method != "depth_norm":
-            filter_variable = get_filter_variable(method, scene.gaussians, model_path=scene.model_path, iteration=iteration)
-            if method == "depth_weighted_viewpoint_vog":
-                filter_variable_const = filter_variable.clone()
-            print("Filtering Based on: ", method)
-            print("Filter Variable Shape: ", filter_variable.shape)
-            print("Number of No-Variance: ", torch.sum(filter_variable < 0).item(), "out of ", filter_variable.numel())
-            filter_thresholds = torch.quantile(filter_variable, quantiles)
+        print("Filtering Based on: ", method)
+        if method != "depth_zs" and method != "depth_norm":  # Get filtering variables and thresholds based on method
+            filter_variable, filter_variable_const, filter_thresholds = get_filter_variable(method, quantiles, scene, iteration)
 
         for config in validation_configs:
-            l1_losses = []
-            l_ssims = []
-            psnrs = []
+            l1_losses, l_ssims, psnrs = [], [], []
             for t_idx, threshold in enumerate(filter_thresholds):
-                l1 = 0.0
-                l_ssim = 0.0
-                psnr_metric = 0.0
+                l1, l_ssim, psnr_metric = 0.0, 0.0, 0.0
                 if config['cameras'] and len(config['cameras']) > 0:
-                    # Save histogram of variable
-                    if "test" in config['name']:
-                        tb_writer.add_histogram(f"test_filter/filter_variable_{method}", filter_variable, global_step=iteration)
-
                     for idx, viewpoint in enumerate(config['cameras']):
                         if "depth" in method:
-                            if method == "depth_weighted_viewpoint_vog":
-                                filter_variable = get_depth_weighted_gradient_variance(variances=filter_variable_const, gaussians=scene.gaussians, viewpoint_camera=viewpoint)
-                            if method == "depth_zs":
-                                filter_variable = get_depths(gaussians=scene.gaussians, viewpoint_camera=viewpoint) # TODO I don't think this really gets true depth, only z coord
-                            if method == "depth_norm":
-                                filter_variable = get_depths(gaussians=scene.gaussians, viewpoint_camera=viewpoint, norm=True)
-                            threshold = torch.quantile(filter_variable, quantiles[t_idx])
+                            filter_variable, threshold = get_depth_specific_filter_variable(method, filter_variable_const, quantiles, scene, viewpoint, t_idx)
 
                         # Render image
-                        render_pkg = render(viewpoint, scene.gaussians, *renderArgs, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, filter_criteria=filter_variable, filter_threshold=threshold)
+                        remove_high = method not in ["depth_zs", "depth_norm", "inverse_viewpoint_vog"]
+                        render_pkg = render(viewpoint, scene.gaussians, *renderArgs, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, filter_criteria=filter_variable, filter_threshold=threshold, filter_high=remove_high)
                         image = render_pkg["render"]
 
                         if viewpoint.alpha_mask is not None:
@@ -340,31 +347,10 @@ def evaluate_gaussian_filtering(tb_writer, opt_params, iteration, scene : Scene,
                         image = torch.clamp(image, 0.0, 1.0)
 
                         if "vog" in method and "test" in config['name']: # Render uncertainty
-                            render_uncertainty_pkg = render_uncertainty(filter_variable, viewpoint, scene.gaussians, *renderArgs)
-                            render_uncertainty_image = render_uncertainty_pkg["render"][0].unsqueeze(0)
+                            render_uncertainty_image = get_rendered_uncertainty(viewpoint, scene, renderArgs, filter_variable, method, iteration, uq_path)
 
-                            if torch.any(torch.logical_or(torch.isnan(render_uncertainty_image), torch.isinf(render_uncertainty_image))):
-                                valid_uncertainties = render_uncertainty_image[torch.logical_not(torch.logical_or(torch.isnan(render_uncertainty_image), torch.isinf(render_uncertainty_image)))]
-                                if len(valid_uncertainties) == 0:
-                                    print(f"[eval] everything is nan for UQ")
-                                    not_nan_max = 100.0 # TODO Should look into this value and this general if-statement
-                                else:
-                                    not_nan_max = torch.max(valid_uncertainties).item()
-                                render_uncertainty_image = torch.nan_to_num(render_uncertainty_image, not_nan_max, not_nan_max)
-
-                            normalized_render_uncertainty_image = torch.clamp(render_uncertainty_image / torch.max(render_uncertainty_image), 0.0, 1.0)
-
-                            # Save to tensorboard
-                            tag_header = config['name'] + "_view_{}".format(viewpoint.image_name)
-                            # tb_writer.add_images(f"{tag_header}/uncertainty", render_uncertainty_image[None], global_step=iteration)
-                            tb_writer.add_images(f"{tag_header}/normalized_uncertainty_{method}", normalized_render_uncertainty_image[None], global_step=iteration)
-                            
-                            image_name = "norm_uq_" + method + "_no_{}".format(viewpoint.image_name) + "_" + str(iteration) + ".png"
-                            save_image(normalized_render_uncertainty_image, f"{image_path}/{image_name}")
-                            
-
-                        if "test" in config['name'] and "vog" in method:
-                            tb_writer.add_images(f"{tag_header}/filtered_image_{method}", image[None], global_step=t_idx)
+                        if "test" in config['name'] and (idx == 0 or idx == 6 or idx == 13):
+                            save_render(image, image_path, viewpoint, method, iteration, t_idx)
 
                         # get the groundtruth rgb image
                         gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -379,6 +365,7 @@ def evaluate_gaussian_filtering(tb_writer, opt_params, iteration, scene : Scene,
 
                     # Plot debugging histogram
                     if "vog" in method and t_idx == 0:
+                        tag_header = config['name'] + "_view_{}".format(viewpoint.image_name)
                         plot_histogram(render_uncertainty_image.flatten().tolist(), title=tag_header + "_" + method + "_Uncertainty_Render", folder_path=hist_path, iteration=iteration)
 
                     l1 /= len(config['cameras'])
@@ -398,7 +385,7 @@ def evaluate_gaussian_filtering(tb_writer, opt_params, iteration, scene : Scene,
             print("PSNRS: ", psnrs)
             print("Thresholds: ", filter_thresholds)
     
-    plot_filter(filter_thresholds, quantiles.cpu().numpy(), all_l1_losses, all_l_ssims, all_psnrs, filter_path, iteration, methods, validation_configs)
+    plot_filter(filter_thresholds, quantiles.cpu().numpy(), all_l1_losses, all_l_ssims, all_lpipses, all_psnrs, filter_path, iteration, methods, validation_configs)
 
 if __name__ == "__main__":
     # Set up command line argument parser

@@ -60,8 +60,12 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
-        self.xyz_gradient_individual = torch.empty(0)
-        self.img_idxs_grads_stored = torch.empty(0)
+
+        self.xy_gradient_at_cam = torch.empty(0)
+        self.cam_idxs_grads_stored = torch.empty(0)
+        self.xy_gradient_at_iter = torch.empty(0)
+        self.xy_gradient_iter_count = 0
+
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -144,7 +148,13 @@ class GaussianModel:
         return sds
     
     def get_inter_view_gradients(self):
-        return self.xyz_gradient_individual
+        return self.xy_gradient_at_cam
+    
+    def get_inter_iter_gradients(self):
+        return self.xy_gradient_at_iter
+    
+    def get_cam_idxs_grads_stored(self):
+        return self.cam_idxs_grads_stored
 
     def get_exposure_from_name(self, image_name):
         if self.pretrained_exposures is None:
@@ -158,6 +168,14 @@ class GaussianModel:
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+
+    def sample_init_points(self):
+        # Perturb initial Gaussians by sampling from them to create new center coord, for random initialization ensembeling
+        print("Jittering Initial Gaussian Points")
+        with torch.no_grad():
+            means = self._xyz
+            stds = torch.exp(self._scaling)
+            self._xyz.copy_(torch.normal(mean=means, std=stds))
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
@@ -485,21 +503,41 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def add_grad(self, viewspace_point_tensor, visibility_filter, image_idx, num_images, method="split"):
-        if self.xyz_gradient_individual.shape[0] < 2: 
-            self.img_idxs_grads_stored = torch.zeros(num_images)
+    def add_grads_cam(self, viewspace_point_tensor, visibility_filter, image_idx, num_images, method="split"):
+        # Add gradient to cam/image specific gradient tracker
+        if self.xy_gradient_at_cam.shape[0] < 2: 
+            self.cam_idxs_grads_stored = torch.zeros(num_images)
             if method == "norm": # If empty then initialize to shape num_gaussians x num_images
-                self.xyz_gradient_individual = torch.full((self.get_xyz.shape[0], num_images), fill_value=float('nan'), dtype=torch.float32, device="cuda")
-            if method == "split":
-                self.xyz_gradient_individual = torch.full((self.get_xyz.shape[0], num_images, 2), fill_value=float('nan'), dtype=torch.float32, device="cuda")
+                self.xy_gradient_at_cam = torch.full((self.get_xyz.shape[0], num_images), fill_value=float('nan'), dtype=torch.float32, device="cuda")
+            elif method == "split":
+                self.xy_gradient_at_cam = torch.full((self.get_xyz.shape[0], num_images, 2), fill_value=float('nan'), dtype=torch.float32, device="cuda")
 
         if method == "norm":
-            self.xyz_gradient_individual[visibility_filter, image_idx] = torch.norm(viewspace_point_tensor.grad[visibility_filter,:2], dim=-1)
-        if method == "split":
-            self.xyz_gradient_individual[visibility_filter, image_idx] = viewspace_point_tensor.grad[visibility_filter,:2]
+            self.xy_gradient_at_cam[visibility_filter, image_idx] = torch.norm(viewspace_point_tensor.grad[visibility_filter,:2], dim=-1)
+        elif method == "split":
+            self.xy_gradient_at_cam[visibility_filter, image_idx] = viewspace_point_tensor.grad[visibility_filter,:2]
 
-        self.img_idxs_grads_stored[image_idx] = 1
+        self.cam_idxs_grads_stored[image_idx] = 1
 
-    def reset_grad_tracking(self):
-        self.xyz_gradient_individual = torch.empty(0)
-        self.img_idxs_grads_stored = torch.empty(0)
+    def add_grads_iter(self, viewspace_point_tensor, visibility_filter, num_iters, method="split"): # TODO need to account for densification changes 
+        # Add gradient to iter specific gradient tracker
+        if self.xy_gradient_at_iter.shape[0] < 2: 
+            self.xy_gradient_iter_count = 0
+            if method == "norm": # If empty then initialize to shape num_gaussians x num_iters
+                self.xy_gradient_at_iter = torch.full((self.get_xyz.shape[0], num_iters), fill_value=float('nan'), dtype=torch.float32, device="cuda")
+            elif method == "split":
+                self.xy_gradient_at_iter = torch.full((self.get_xyz.shape[0], num_iters, 2), fill_value=float('nan'), dtype=torch.float32, device="cuda")
+
+        if method == "norm":
+            self.xy_gradient_at_iter[visibility_filter, self.xy_gradient_iter_count] = torch.norm(viewspace_point_tensor.grad[visibility_filter,:2], dim=-1)
+        elif method == "split":
+            self.xy_gradient_at_iter[visibility_filter, self.xy_gradient_iter_count] = viewspace_point_tensor.grad[visibility_filter,:2]
+
+        if self.xy_gradient_iter_count == num_iters - 1:
+            self.xy_gradient_iter_count = 0
+        else:
+            self.xy_gradient_iter_count += 1
+
+    def reset_grad_cam_tracking(self):
+        self.xy_gradient_at_cam = torch.empty(0)
+        self.cam_idxs_grads_stored = torch.empty(0)

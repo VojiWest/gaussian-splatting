@@ -1,23 +1,56 @@
 import torch
+from torchvision.utils import save_image
 import os
-import matplotlib.pyplot as plt
 
 from scene import Scene, GaussianModel
+from utils.plot_utils import plot_histogram
 
-def get_filter_variable(filter_criterion, gaussians : GaussianModel, model_path, iteration):
-    if "sd" in filter_criterion:
-        if "max" in filter_criterion:
-            filter_variable = gaussians.get_sd(method='max')
-        elif "mean" in filter_criterion:
-            filter_variable = gaussians.get_sd(method='mean')
+def create_paths(scene : Scene):
+    filter_path = os.path.join(scene.model_path, "Filtering")
+    hist_path = os.path.join(scene.model_path, "Histogram")
+    image_path = os.path.join(scene.model_path, "Renders")
+    uq_path = os.path.join(scene.model_path, "Uncertainty")
+    if not os.path.exists(filter_path):
+        os.makedirs(filter_path)
+    if not os.path.exists(hist_path):
+        os.makedirs(hist_path)
+    if not os.path.exists(image_path):
+        os.makedirs(image_path)
+    if not os.path.exists(uq_path):
+        os.makedirs(uq_path)
+
+    return filter_path, hist_path, image_path, uq_path
+
+def calculate_filter_variable(filter_criterion, gaussians : GaussianModel, model_path, iteration):
+    if "sd_max" in filter_criterion:
+        filter_variable = gaussians.get_sd(method='max')
         return filter_variable
+    elif "mean" in filter_criterion:
+        filter_variable = gaussians.get_sd(method='mean')
+        return filter_variable
+    
     if "vog" in filter_criterion:
-        grads = gaussians.get_inter_view_gradients()
+        if "sd" in filter_criterion:
+            method = "sd"
+        else:
+            method = "var"
         if "viewpoint" in filter_criterion:
-            variance = get_inter_view_gradient_variance(gradients=grads, method='sd', model_path=model_path, iteration=iteration)
-            return variance
+            grads = gaussians.get_inter_view_gradients()
+            variance = get_inter_view_gradient_variance(gradients=grads, method=method, model_path=model_path, iteration=iteration)
+        elif "iteration" in filter_criterion:
+            grads = gaussians.get_inter_iter_gradients()
+            variance = get_inter_view_gradient_variance(gradients=grads, method=method, model_path=model_path, iteration=iteration)
+        return variance
+    
+    if "grad" in filter_criterion:
+        grads = gaussians.get_inter_view_gradients()
+        norm = get_mean_gradient_norm(gradients=grads)
+        return norm
+
     if "random" in filter_criterion:
         return torch.rand(gaussians.get_xyz.shape[0])
+    
+    return torch.rand(gaussians.get_xyz.shape[0])
 
 def filter_gaussians(filter_criteria, filter_threshold, means3D, means2D, shs, colors_precomp, opacity, scales, rotations, cov3D_precomp, remove_above_filter=True):
     if remove_above_filter:
@@ -98,8 +131,35 @@ def get_inter_view_gradient_variance(gradients, method='var', model_path="", ite
             
     return spreads
 
-def get_depth_weighted_gradient_variance(variances, gaussians, viewpoint_camera, depth_lambda = 1):
-    depths = get_depths(gaussians, viewpoint_camera)
+def get_mean_gradient_norm(gradients):
+    norms = torch.zeros(gradients.shape[0])
+    for idx, gaussian_grads in enumerate(gradients):
+        if gaussian_grads.ndim == 2:
+            g1 = gaussian_grads[:,0]
+            g2 = gaussian_grads[:,1]
+
+            mask = ~torch.isnan(g1) & ~torch.isnan(g2)
+
+            if mask.any():
+                g_valid = gaussian_grads[mask]
+                norms[idx] = torch.mean(torch.norm(g_valid, dim=1))
+            else:
+                norms[idx] = 0.0
+        
+        elif gaussian_grads.ndim == 1:
+            mask = ~torch.isnan(gaussian_grads)
+            gaussian_non_zero = gaussian_grads[mask]
+
+            if gaussian_non_zero.numel() > 0:
+                norms[idx] = torch.mean(gaussian_non_zero)
+            else:
+                norms[idx] = 0.0
+            
+    return norms
+
+
+def get_depth_weighted_gradient_variance(variances, gaussians, viewpoint_camera, depth_cal = "zs", depth_lambda = 1):
+    depths = get_depths(gaussians, viewpoint_camera, depth_cal)
     dw_variances = variances * (depth_lambda / (depths+0.0001))
 
     # print("Variances: ", variances)
@@ -112,7 +172,7 @@ def homogenize_points(points):
     """Convert batched points (xyz) to (xyz1)."""
     return torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
 
-def get_depths(gaussians, viewpoint_camera, norm=False):
+def get_depths(gaussians, viewpoint_camera, depth_cal="zs"):
     # Taken from gaussian_rendeder
 
     points_world = gaussians.get_xyz # torch.Size([25837, 3]), torch.float32
@@ -127,52 +187,14 @@ def get_depths(gaussians, viewpoint_camera, norm=False):
     points_cam = points_cam_homogenized[:, :3]
 
     # get the zs and use as color for rendering
-    if norm:
-        depths = torch.norm(points_cam, dim=-1)
-    else:
+    if depth_cal == "zs":
         depths = points_cam[:, 2]
+    elif depth_cal == "norm": # Take norm
+        depths = torch.norm(points_cam, dim=-1)
 
     return depths.cpu()
 
-def plot_filter(filter_thresholds, quantiles, l1_losses, l_ssims, psnrs, folder_path, iteration, methods, split_names):
-    splits = [split_names[0]['name'].split("_")[1], split_names[1]['name'].split("_")[1]]
-    colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k']
-
-    # x = filter_thresholds
-    x = quantiles
-
-    title = "GS L1 Loss Filtering"
-    for idx, loss in enumerate(l1_losses):
-        linetype = ':'
-        if idx % 2 == 1:
-            linetype = '-'
-        plt.plot(x, loss, color=colors[idx // 2], label = splits[idx % 2] + " " + methods[idx // 2], linestyle=linetype)
-
-    plt.title(title)
-    plt.ylabel("L1 Loss")
-    x_label = "Percentile Kept"
-    plt.xlabel(x_label)
-    plt.legend()
-    plt.savefig(f"{folder_path}/loss_filter_plot_{iteration}.png")
-    plt.close()
-
-    for idx, psnr in enumerate(psnrs):
-        linetype = ':'
-        if idx % 2 == 1:
-            linetype = '-'
-        plt.plot(x, psnr, color=colors[idx // 2], label = splits[idx % 2] + " " + methods[idx // 2], linestyle=linetype)
-    title = "GS PSNR Filtering"
-    plt.title(title)
-    plt.ylabel("PSNR")
-    x_label = "Percentile Kept"
-    plt.xlabel(x_label)
-    plt.legend()
-    plt.savefig(f"{folder_path}/psnr_filter_plot_{iteration}.png")
-    plt.close()
-
-def plot_histogram(data, title, folder_path, iteration):
-    plt.hist(data, bins=100)
-    plt.yscale('log', nonpositive='clip')
-    plt.title(title)
-    plt.savefig(f"{folder_path}/hist_{title}_{iteration}.png")
-    plt.close()
+def save_render(image, save_path, viewpoint, method, iteration, t_idx):
+    image_name = method + "_no_{}".format(viewpoint.image_name) + "_" + str(iteration) + "_" + str(t_idx) + ".png"
+    save_image(image, f"{save_path}/{image_name}")
+    

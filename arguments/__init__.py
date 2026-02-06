@@ -98,7 +98,13 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.optimizer_type = "default"
 
-        self.filter_criteria = "viewpoint_vog,depth_weighted_viewpoint_vog,depth_zs,depth_norm,sd_max,sd_mean,random"
+        # Filtering
+        self.do_filtering = False
+        self.filter_criteria = "iteration_vog_var,depth_norm_weighted_iteration_vog_var,grad_norm,inverse_viewpoint_vog_var,viewpoint_vog_var,depth_norm_weighted_viewpoint_vog_var,depth_zs,depth_norm,sd_max,sd_mean,random" # iteration_vog,depth_weighted_iteration_vog,
+        self.depth_weighted_filtering = True
+
+        # Ensembeling
+        self.jitter_init = False
 
         super().__init__(parser, "Optimization Parameters")
 

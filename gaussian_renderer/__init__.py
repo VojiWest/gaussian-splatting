@@ -16,7 +16,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.filter_utils import filter_gaussians
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, filter_criteria=None, filter_threshold=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, filter_criteria=None, filter_threshold=None, filter_high=True):
     """
     Render the scene. 
     
@@ -99,7 +99,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             opacity = opacity,
             scales = scales,
             rotations = rotations,
-            cov3D_precomp = cov3D_precomp
+            cov3D_precomp = cov3D_precomp,
+            remove_above_filter=filter_high
         )
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 

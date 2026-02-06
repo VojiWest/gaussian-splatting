@@ -14,8 +14,9 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.filter_utils import filter_gaussians
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, filter_criteria=None, filter_threshold=None):
     """
     Render the scene. 
     
@@ -86,6 +87,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
 
+    # If there is a filtering criterion, then filter Gaussians (and their attributes) that exceed the threshold
+    if filter_criteria is not None:
+        means3D, means2D, shs, colors_precomp, opacity, scales, rotations, cov3D_precomp = filter_gaussians(
+            filter_criteria = filter_criteria,
+            filter_threshold = filter_threshold,
+            means3D = means3D,
+            means2D = means2D,
+            shs = shs,
+            colors_precomp = colors_precomp,
+            opacity = opacity,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp
+        )
+
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     if separate_sh:
         rendered_image, radii, depth_image = rasterizer(
@@ -126,3 +142,23 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         }
     
     return out
+
+def render_uncertainty(uncertainty, viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, filter_criteria=None, filter_threshold=None):
+    uncertainty = uncertainty.to(pc.get_xyz.device)
+
+    repeated_uncertainties = uncertainty.unsqueeze(-1).repeat(1,3)
+
+    # print("Repeated UQs Shape: ", repeated_uncertainties.shape)
+    # print("First UQ: ", uncertainty[0].item())
+
+
+    return render(
+        viewpoint_camera=viewpoint_camera,
+        pc=pc,
+        pipe=pipe,
+        bg_color=bg_color,
+        scaling_modifier=scaling_modifier,
+        override_color=repeated_uncertainties,
+        filter_criteria=filter_criteria, 
+        filter_threshold=filter_threshold,
+    )

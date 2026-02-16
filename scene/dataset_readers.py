@@ -36,10 +36,12 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
+    is_val: bool
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
+    val_cameras: list
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
@@ -68,7 +70,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list, val_cam_names_list):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -111,7 +113,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                              width=width, height=height, is_test=image_name in test_cam_names_list, is_val=image_name in val_cam_names_list)
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -142,7 +144,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def readColmapSceneInfo(path, images, depths, eval, val, train_test_exp, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -184,20 +186,30 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             cam_names = [cam_extrinsics[cam_id].name for cam_id in cam_extrinsics]
             cam_names = sorted(cam_names)
             test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
+            if val:
+                val_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == llffhold // 2]
+            else:
+                val_cam_names_list = []
         else:
             with open(os.path.join(path, "sparse/0", "test.txt"), 'r') as file:
                 test_cam_names_list = [line.strip() for line in file]
     else:
         test_cam_names_list = []
+        val_cam_names_list = []
+
 
     reading_dir = "images" if images == None else images
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
-        depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
+        depths_folder=os.path.join(path, depths) if depths != "" else "", 
+        test_cam_names_list=test_cam_names_list,
+        val_cam_names_list=val_cam_names_list
+        )
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
+    train_cam_infos = [c for c in cam_infos if train_test_exp or (not c.is_test and not c.is_val)]
+    val_cam_infos = [c for c in cam_infos if c.is_val]
     test_cam_infos = [c for c in cam_infos if c.is_test]
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
@@ -219,6 +231,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
+                           val_cameras=val_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
@@ -281,6 +294,7 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
     if not eval:
         train_cam_infos.extend(test_cam_infos)
         test_cam_infos = []
+    val_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -303,6 +317,7 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
+                           val_cameras=val_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,

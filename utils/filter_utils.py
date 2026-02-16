@@ -23,10 +23,10 @@ def create_paths(scene : Scene):
 
 def calculate_filter_variable(filter_criterion, gaussians : GaussianModel, model_path, iteration):
     if "sd_max" in filter_criterion:
-        filter_variable = gaussians.get_sd(method='max')
+        filter_variable = gaussians.get_sd(method='max').cpu()
         return filter_variable
     elif "mean" in filter_criterion:
-        filter_variable = gaussians.get_sd(method='mean')
+        filter_variable = gaussians.get_sd(method='mean').cpu()
         return filter_variable
     
     if "vog" in filter_criterion:

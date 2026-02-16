@@ -11,6 +11,9 @@
 
 import os
 import torch
+import json
+from pathlib import Path
+import numpy as np
 from torchvision.utils import save_image
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -28,6 +31,8 @@ from utils.filter_utils import create_paths, save_render
 from utils.plot_utils import plot_filter, plot_histogram
 from utils.ensemble_utils import * 
 from filtering.filter import get_filter_variable, get_depth_specific_filter_variable
+from uq_metrics.auce import auce
+from uq_metrics.ause import ause
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -47,7 +52,7 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, ens=False):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -223,6 +228,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+    if ens:
+        validation_configs = ({'name': 'eval_test', 'cameras' : scene.getTestCameras()},
+                            {'name': 'eval_val', 'cameras' : scene.getValCameras()},
+                            {'name': 'eval_train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 51, 5)]})
+        train_renders = []
+        val_renders = []
+        test_renders = []
+
+        train_img_names = []
+        val_img_names = []
+        test_img_names = []
+        with torch.no_grad():
+            for split_idx, config in enumerate(validation_configs):
+                if config['cameras'] and len(config['cameras']) > 0:
+                    for idx, viewpoint in enumerate(config['cameras']):
+                        # Render image
+                        render_pkg = render(viewpoint, scene.gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+                        image = render_pkg["render"]
+
+                        if viewpoint.alpha_mask is not None:
+                            alpha_mask = viewpoint.alpha_mask.cuda()
+                            image *= alpha_mask
+                        
+                        if "train" in config['name'].split("_")[1]:
+                            train_renders.append(image)
+                            train_img_names.append(viewpoint.image_name)
+                        elif "val" in config['name'].split("_")[1]:
+                            val_renders.append(image)
+                            val_img_names.append(viewpoint.image_name)
+                        elif "test" in config['name'].split("_")[1]:
+                            test_renders.append(image)
+                            test_img_names.append(viewpoint.image_name)
+        
+        return train_renders, train_img_names, val_renders, val_img_names, test_renders, test_img_names, scene
+
+                        
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -328,28 +370,32 @@ def evaluate_gaussian_filtering(tb_writer, opt_params, iteration, scene : Scene,
 
         for config in validation_configs:
             l1_losses, l_ssims, psnrs = [], [], []
+            ause_metric, auce_metric = 0.0, 0.0
             for t_idx, threshold in enumerate(filter_thresholds):
                 l1, l_ssim, psnr_metric = 0.0, 0.0, 0.0
                 if config['cameras'] and len(config['cameras']) > 0:
                     for idx, viewpoint in enumerate(config['cameras']):
+                        val_or_test = ("test" in config['name'].split("_")[1] or "val" in config['name'].split("_")[1])
                         if "depth" in method:
                             filter_variable, threshold = get_depth_specific_filter_variable(method, filter_variable_const, quantiles, scene, viewpoint, t_idx)
 
                         # Render image
-                        remove_high = method not in ["depth_zs", "depth_norm", "inverse_viewpoint_vog"]
-                        render_pkg = render(viewpoint, scene.gaussians, *renderArgs, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, filter_criteria=filter_variable, filter_threshold=threshold, filter_high=remove_high)
+                        remove_high = method != "depth_zs" and method != "depth_norm" and "inverse" not in method
+                        if t_idx == len(quantiles) - 1: # Render without filtering
+                            render_pkg = render(viewpoint, scene.gaussians, *renderArgs, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+                        else:
+                            render_pkg = render(viewpoint, scene.gaussians, *renderArgs, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, filter_criteria=filter_variable, filter_threshold=threshold, filter_high=remove_high)
+                        
                         image = render_pkg["render"]
-
                         if viewpoint.alpha_mask is not None:
                             alpha_mask = viewpoint.alpha_mask.cuda()
                             image *= alpha_mask
-
                         image = torch.clamp(image, 0.0, 1.0)
 
-                        if "vog" in method and "test" in config['name']: # Render uncertainty
+                        if ("vog" in method or "random" in method) and val_or_test and (t_idx == len(quantiles) - 1): # Render uncertainty
                             render_uncertainty_image = get_rendered_uncertainty(viewpoint, scene, renderArgs, filter_variable, method, iteration, uq_path)
 
-                        if "test" in config['name'] and (idx == 0 or idx == 6 or idx == 13):
+                        if val_or_test and (idx == 0 or idx == 6 or idx == 13):
                             save_render(image, image_path, viewpoint, method, iteration, t_idx)
 
                         # get the groundtruth rgb image
@@ -363,8 +409,13 @@ def evaluate_gaussian_filtering(tb_writer, opt_params, iteration, scene : Scene,
                         l_ssim += ssim(image, gt_image).mean().double()
                         psnr_metric += psnr(image, gt_image).mean().double()
 
+                        if ("vog" in method or "random" in method) and val_or_test and (t_idx == len(quantiles) - 1):
+                            flat_rgb_uncertainty = render_uncertainty_image.repeat(3,1,1).flatten()
+                            ause_metric += ause(flat_rgb_uncertainty, ((image - gt_image) ** 2).flatten(), err_type="mse")[3]
+                            auce_metric += auce(np.array(image.flatten().cpu()), np.array(flat_rgb_uncertainty.cpu()), np.array(gt_image.flatten().cpu()))["auc_abs_error_values"]
+
                     # Plot debugging histogram
-                    if "vog" in method and t_idx == 0:
+                    if "vog" in method and (t_idx == len(quantiles) - 1):
                         tag_header = config['name'] + "_view_{}".format(viewpoint.image_name)
                         plot_histogram(render_uncertainty_image.flatten().tolist(), title=tag_header + "_" + method + "_Uncertainty_Render", folder_path=hist_path, iteration=iteration)
 
@@ -383,9 +434,80 @@ def evaluate_gaussian_filtering(tb_writer, opt_params, iteration, scene : Scene,
             all_psnrs.append(psnrs)
 
             print("PSNRS: ", psnrs)
+            print("SSIMs: ", l_ssims)
             print("Thresholds: ", filter_thresholds)
+
+            if ("vog" in method or "random" in method) and val_or_test:
+                ause_metric /= len(config['cameras'])
+                auce_metric /= len(config['cameras'])
+                print("Method: ", method)
+                print("Ensemble AUSE: ", ause_metric)
+                print("Ensemble AUCE: ", auce_metric)
+
+                metrics = {"AUSE": ause_metric, "AUCE": auce_metric}
+                file_name = "ensemble_metrics_" + str(method) + "_" + config['name'].split("_")[1] + ".json"
+                metrics_file = Path(scene.model_path) / file_name
+                with open(str(metrics_file), 'w') as f:
+                    json.dump(metrics, f)
     
     plot_filter(filter_thresholds, quantiles.cpu().numpy(), all_l1_losses, all_l_ssims, all_lpipses, all_psnrs, filter_path, iteration, methods, validation_configs)
+
+def ensemble(model_params, opt_params, pipe_params, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, model_path, num_models = 5):
+    all_train_renders, all_test_renders = [], []
+    all_train_image_names, all_test_image_names = [], []
+    for m_idx in range(num_models):
+        train_renders, train_image_names, val_renders, val_image_names, test_renders, test_image_names, scene = training(model_params, opt_params, pipe_params, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, ens=True)
+        all_train_renders.append(train_renders)
+        all_test_renders.append(test_renders)
+        all_train_image_names.append(train_image_names)
+        all_test_image_names.append(test_image_names)
+
+    ens_path = create_ens_path(model_params.model_path)
+
+
+    mean, var, ordered_names = get_ensemble_variance(all_test_renders, all_test_image_names, normalize=True)
+    save_ens_uncertainty(var, ordered_names, ens_path)
+    save_ens_mean_pred(mean, ordered_names, ens_path)
+
+
+    ### Get Ensemble Performance Metrics
+    viewpoints = scene.getTestCameras()
+    l1, l_ssim, psnr_metric = 0.0, 0.0, 0.0
+    ause_metric, auce_metric = 0.0, 0.0
+    for view in viewpoints:
+        view_name = view.image_name
+        gt_image = torch.clamp(view.original_image.cpu(), 0.0, 1.0)
+        render_idx = ordered_names.index(view_name)
+
+        mean_render = mean[render_idx].cpu()
+        var_render = var[render_idx].cpu()
+
+        l1 += l1_loss(mean_render, gt_image).mean().double()
+        l_ssim += ssim(mean_render, gt_image).mean().double()
+        psnr_metric += psnr(mean_render, gt_image).mean().double()
+
+        ### Get Ensemble UQ Metrics
+        ratio_removed, ause_err, ause_err_by_var, ause_value = ause(var_render.flatten(), ((mean_render - gt_image) ** 2).flatten(), err_type="mse")
+        auce_dict = auce(np.array(mean_render.flatten()), np.array(var_render.flatten()), np.array(gt_image.flatten()))
+        ause_metric += ause_value
+        auce_metric += auce_dict["auc_abs_error_values"]
+
+    l1 /= len(viewpoints)
+    l_ssim /= len(viewpoints)
+    psnr_metric /= len(viewpoints)
+    ause_metric /= len(viewpoints)
+    auce_metric /= len(viewpoints)
+
+    print("Ensemble L1: ", l1.item())
+    print("Ensemble SSIM: ", l_ssim.item())
+    print("Ensemble PSNR: ", psnr_metric.item())
+    print("Ensemble AUSE: ", ause_metric)
+    print("Ensemble AUCE: ", auce_metric)
+
+    metrics = {"SSIM": l_ssim.item(), "PSNR": psnr_metric.item(), "AUSE": ause_metric, "AUCE": auce_metric}
+    metrics_file = Path(model_params.model_path) / "ensemble_metrics.json"
+    with open(str(metrics_file), 'w') as f:
+        json.dump(metrics, f)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -403,6 +525,7 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--ens",  action='store_true', default=False)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -415,7 +538,10 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    if args.ens:
+        ensemble(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.model_path)
+    else:
+        training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done
     print("\nTraining complete.")

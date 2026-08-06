@@ -106,6 +106,11 @@ class OptimizationParams(ParamGroup):
 
         # Ensembeling
         self.jitter_init = False
+        self.randomize_init = False
+        self.filter_ens = False
+
+        # Early Stopping
+        self.patience = 3
 
         super().__init__(parser, "Optimization Parameters")
 

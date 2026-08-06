@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import numpy as np
 
 def new_plot_filter(filter_thresholds, quantiles, l1_losses, l_ssims, all_lpipses, psnrs, folder_path, iteration, methods, split_names):
     splits = [split_names[0]['name'].split("_")[1], split_names[1]['name'].split("_")[1]]
@@ -26,6 +27,7 @@ def new_plot_filter(filter_thresholds, quantiles, l1_losses, l_ssims, all_lpipse
         "sd_max" : "Max Gaussian Scale",
         "sd_mean" : "Mean Gaussian Scale",
         "random" : "Random",
+        "ensemble" : "Ensemble",
     }
 
     x = quantiles
@@ -200,4 +202,29 @@ def plot_histogram(data, title, folder_path, iteration):
     plt.yscale('log', nonpositive='clip')
     plt.title(title)
     plt.savefig(f"{folder_path}/hist_{title}_{iteration}.png")
+    plt.close()
+
+def plot_ause(ause_diff, ause_err_by_var, ause_err, save_dir="./imgs", output="rgb"):
+    ratio_removed = np.linspace(0, 1, 100, endpoint=False)
+
+    plt.plot(ratio_removed, ause_diff, label="Difference")
+    plt.plot(ratio_removed, ause_err_by_var, color="blue", linestyle=":", label="Error Sorted by Variance")
+    plt.plot(ratio_removed, ause_err, color="red", linestyle=":", label="Error Descending")
+    plt.ylabel("Normalized Mean Error")
+    plt.xlabel("Ratio of Pixels Removed")
+    plt.legend()
+    plt.savefig("%s/%s_ause_p.png" % (save_dir, output))
+    plt.close()
+
+def plot_auce(auce_coverages, save_dir="./imgs", output="rgb"):
+    alphas = list(np.arange(start=0.01, stop=1.0, step=0.01))
+
+    plt.plot([0.0, 1.0], [0.0, 1.0], "k:", label="Perfect")
+    plt.plot(alphas, np.flip(auce_coverages, 0))
+    plt.legend()
+    plt.ylabel("Empirical coverage")
+    plt.xlabel("p")
+    plt.title("Prediction intervals - Empirical coverage")
+    plt.savefig("%s/%s_empirical_coverage.png" % (save_dir, output))
+    plt.show()
     plt.close()

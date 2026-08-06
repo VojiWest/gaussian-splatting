@@ -1,6 +1,7 @@
 import torch
 from torchvision.utils import save_image
 import os
+from torch.distributions import MultivariateNormal
 
 from scene import Scene, GaussianModel
 from utils.plot_utils import plot_histogram
@@ -197,4 +198,18 @@ def get_depths(gaussians, viewpoint_camera, depth_cal="zs"):
 def save_render(image, save_path, viewpoint, method, iteration, t_idx):
     image_name = method + "_no_{}".format(viewpoint.image_name) + "_" + str(iteration) + "_" + str(t_idx) + ".png"
     save_image(image, f"{save_path}/{image_name}")
+
+def get_gaussian_weighted_cover(coords, variance, means, cov):
+    dist = MultivariateNormal(means, cov)
+
+    # Evaluate Gaussian on grid
+    log_weights = dist.log_prob(coords)
+    weights = torch.exp(log_weights)
+    weights_clamped = torch.clamp(weights, 0, 1) # Clamp to one to account for exploding values when gaussian scale is smaller than a single pixel
+
+    # Weight image
+    weighted_img = variance * weights_clamped
+    img_sum = torch.sum(weighted_img)
+
+    return img_sum
     

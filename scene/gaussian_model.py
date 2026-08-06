@@ -176,6 +176,19 @@ class GaussianModel:
             means = self._xyz
             stds = torch.exp(self._scaling)
             self._xyz.copy_(torch.normal(mean=means, std=stds))
+    
+    def randomize_init_points(self):
+        # Create single Gaussian distribution given all starting points to sample random starting points, for random initialization ensembeling
+        print("Randomizing Initial Gaussian Points")
+        with torch.no_grad():
+            means = torch.mean(self._xyz, dim=0)
+            stds = torch.std(self._xyz, dim=0)
+            new_xyz = torch.normal(mean=means.expand_as(self._xyz), std=stds.expand_as(self._xyz))
+            self._xyz.copy_(new_xyz)
+
+            dist2 = torch.clamp_min(distCUDA2(self._xyz), 0.0000001)
+            scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+            self._scaling.copy_(scales)
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale

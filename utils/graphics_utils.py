@@ -75,3 +75,13 @@ def fov2focal(fov, pixels):
 
 def focal2fov(focal, pixels):
     return 2*math.atan(pixels/(2*focal))
+
+# Function obtained from "https://github.com/sailor-z/SE-GS/blob/main/utils/graphics_utils.py"
+def get_intrinsic(view):
+    fx = fov2focal(view.FoVx, view.image_width)
+    fy = fov2focal(view.FoVy, view.image_height)
+    cx = 0.5 * view.image_width
+    cy = 0.5 * view.image_height
+
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]]).astype(np.float32)
+    return K
